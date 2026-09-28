@@ -30,7 +30,10 @@ const state = {
   // 分组讨论：生成分组表单是否展开；已展示过的方案 id（用于生成成功提示）
   groupFormOpen: false,
   groupSeenId: null,
-  groupExpect: false
+  groupExpect: false,
+  // 现场问题墙：已展示过的问题 id -> {merged, supportCount, mergedInto}（用于变化提示）
+  questionSeeded: false,
+  questionSeen: new Map()
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -121,6 +124,14 @@ const els = {
   groupConstraintChips: $('#group-constraint-chips'),
   btnGroupFormCancel: $('#btn-group-cancel-form'),
   groupResult: $('#group-result'),
+  // 现场问题墙
+  questionForm: $('#question-create-form'),
+  questionTextInput: $('#question-text-input'),
+  questionCharCount: $('#question-char-count'),
+  questionList: $('#question-list'),
+  questionEmpty: $('#question-empty'),
+  questionCount: $('#question-count'),
+  questionMerged: $('#question-merged'),
   toast: $('#toast-container')
 };
 
@@ -308,6 +319,8 @@ function enterRoom(creds) {
   state.groupFormOpen = false;
   state.groupSeenId = null;
   state.groupExpect = false;
+  state.questionSeeded = false;
+  state.questionSeen = new Map();
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -415,6 +428,8 @@ function handleMessage(msg) {
       state.undoSeen = null;
       state.groupSeenId = null;
       state.groupExpect = false;
+      state.questionSeeded = false;
+      state.questionSeen = new Map();
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -471,6 +486,7 @@ function applySnapshot(snap) {
   processUndo(snap);
   processTasks(snap);
   processGroups(snap);
+  processQuestions(snap);
   render();
 }
 
@@ -594,6 +610,7 @@ function render() {
   renderTopic(snap);
   renderTasks(snap);
   renderGroups(snap);
+  renderQuestions(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -1869,6 +1886,190 @@ function renderLogs(snap) {
     els.logList.appendChild(li);
   }
 }
+
+// ---------------------------------------------------------------------------
+// 现场问题墙：提交 / 支持切换 / 主持人合并 / 查看合并去向
+// ---------------------------------------------------------------------------
+
+const QUESTION_TEXT_MAX = 120;
+
+/** 字数统计（按字符数计，与服务端 trim/slice 口径一致） */
+function syncQuestionCharCount() {
+  const len = els.questionTextInput.value.length;
+  els.questionCharCount.textContent = `${len} / ${QUESTION_TEXT_MAX}`;
+  els.questionCharCount.parentElement.classList.toggle('over', len > QUESTION_TEXT_MAX);
+}
+
+els.questionTextInput.addEventListener('input', syncQuestionCharCount);
+
+/**
+ * 变化检测：首次快照（含重连）只播种，不弹提示。
+ * - 我提交的问题出现 -> 成功提示；
+ * - 我支持的问题被合并 -> 提示已并入的目标。
+ */
+function processQuestions(snap) {
+  const qs = snap.questions || { open: [], merged: [] };
+  const all = [...(qs.open || []), ...(qs.merged || [])];
+  const seen = new Set();
+  const myId = state.me ? state.me.id : null;
+  for (const q of all) {
+    seen.add(q.id);
+    const prev = state.questionSeen.get(q.id);
+    if (state.questionSeeded) {
+      if (!prev && myId && q.authorId === myId) {
+        toast('问题已提交', 'success');
+      }
+      if (prev && !prev.merged && q.merged && myId && q.supporterIds.includes(myId)) {
+        toast(`你支持的问题已并入「${q.mergedIntoText || '另一条问题'}」`, 'info');
+      }
+    }
+    state.questionSeen.set(q.id, {
+      merged: q.merged,
+      supportCount: q.supportCount,
+      mergedInto: q.mergedInto
+    });
+  }
+  for (const id of [...state.questionSeen.keys()]) {
+    if (!seen.has(id)) state.questionSeen.delete(id);
+  }
+  state.questionSeeded = true;
+}
+
+/**
+ * 问题墙渲染：
+ * - 未合并问题按快照顺序（服务端按支持人数降序、同票按提交时间升序）；
+ * - 已合并问题列在底部可折叠区，标明直接去向与最终目标文本。
+ */
+function renderQuestions(snap) {
+  const qs = snap.questions || { open: [], merged: [] };
+  const open = qs.open || [];
+  const merged = qs.merged || [];
+  const myId = state.me ? state.me.id : null;
+  const isHost = !!(state.me && state.me.host);
+
+  els.questionCount.textContent = open.length;
+  els.questionEmpty.classList.toggle('hidden', open.length > 0);
+  els.questionList.classList.toggle('hidden', open.length === 0);
+  els.questionList.textContent = '';
+
+  open.forEach((q, i) => {
+    const mine = myId && q.authorId === myId;
+    const supported = myId && q.supporterIds.includes(myId);
+    const li = document.createElement('li');
+    li.className = 'question-item' + (supported ? ' is-supported' : '');
+    li.dataset.questionId = q.id;
+
+    const supporterNames = (q.supporters || []).map((s) => s.nick).slice(0, 6).join('、');
+    const supporterTip = (q.supporters || []).map((s) => s.nick).join('、');
+
+    li.innerHTML = `
+      <span class="question-rank">${i + 1}</span>
+      <div class="question-body">
+        <div class="question-text">${escapeHtml(q.text)}</div>
+        <div class="question-meta">
+          <span>${escapeHtml(q.authorNick)}${q.authorPresent ? '' : '（已离开）'} 提交</span>
+          ${mine ? '<span class="me-tag">我</span>' : ''}
+          <span>${formatTime(q.createdAt)}</span>
+          ${q.supportCount > 0 ? `<span class="question-supported-by" title="${escapeHtml(supporterTip)}">👍 ${escapeHtml(supporterNames)}${q.supportCount > 6 ? ` 等 ${q.supportCount} 人` : ''}</span>` : ''}
+        </div>
+      </div>
+      <button type="button"
+              class="question-support-btn ${supported ? 'picked' : ''}"
+              data-q-act="support" data-q-id="${q.id}"
+              title="${supported ? '再次点击取消支持' : '支持这条问题'}">
+        <span class="question-support-num">${q.supportCount}</span>
+        <span class="question-support-label">${supported ? '已支持' : '支持'}</span>
+      </button>
+      ${isHost ? `
+      <div class="question-host-actions">
+        <button type="button" class="btn btn-ghost btn-mini"
+                data-q-act="merge" data-q-id="${q.id}"
+                title="把另一条问题并入这条问题">🔀 并入此条</button>
+      </div>` : ''}
+    `;
+    els.questionList.appendChild(li);
+  });
+
+  renderMergedQuestions(merged);
+}
+
+/** 已合并问题区：折叠展示，标明直接去向（可在未合并列表中定位最终目标） */
+function renderMergedQuestions(merged) {
+  const box = els.questionMerged;
+  box.textContent = '';
+  if (!merged.length) return;
+
+  const sum = document.createElement('summary');
+  sum.textContent = `已合并问题（${merged.length}）`;
+  box.appendChild(sum);
+
+  const list = document.createElement('ul');
+  list.className = 'question-merged-list';
+  for (const q of merged) {
+    const li = document.createElement('li');
+    li.className = 'question-merged-item';
+    li.innerHTML = `
+      <div class="question-merged-text">${escapeHtml(q.text)}</div>
+      <div class="question-merged-arrow">
+        <span>↳ 已并入</span>
+        <span class="question-merged-target" title="合并去向：${escapeHtml(q.mergedRootId || q.mergedInto || '')}">
+          「${escapeHtml(q.mergedIntoText || '另一条问题')}」
+        </span>
+      </div>
+    `;
+    list.appendChild(li);
+  }
+  box.appendChild(list);
+}
+
+// 提交问题（走版本守卫；空内容服务端会拒绝，这里先拦一次）
+els.questionForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = els.questionTextInput.value.trim();
+  if (!text) return toast('请填写问题内容', 'error');
+  sendCmd({ type: 'question_submit', text });
+  els.questionTextInput.value = '';
+  syncQuestionCharCount();
+});
+
+// 支持切换 / 主持人合并（事件委托，跟随快照重建）
+els.questionList.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-q-act]');
+  if (!btn || btn.disabled) return;
+  const id = btn.dataset.qId;
+  if (btn.dataset.qAct === 'support') {
+    sendCmd({ type: 'question_support', questionId: id });
+  }
+});
+
+/**
+ * 主持人合并：点击某条未合并问题上的「🔀 并入此条」后，选择一条来源问题。
+ * 来源以下拉框列出其余未合并问题（服务端也会再次校验目标必须未合并）。
+ */
+els.questionList.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-q-act="merge"]');
+  if (!btn || !(state.me && state.me.host)) return;
+  const targetId = btn.dataset.qId;
+  const snap = state.snapshot;
+  const candidates = (snap.questions.open || []).filter((q) => q.id !== targetId);
+  if (candidates.length === 0) {
+    return toast('没有其他未合并问题可并入', 'error');
+  }
+  const lines = candidates
+    .map((q, i) => `${i + 1}. [${q.supportCount} 赞] ${q.text.slice(0, 60)}（${q.authorNick}）`)
+    .join('\n');
+  const answer = prompt(
+    `选择要并入「${(snap.questions.open.find((q) => q.id === targetId)?.text || '').slice(0, 40)}」的来源问题，输入序号：\n\n${lines}`
+  );
+  if (answer === null) return;
+  const idx = parseInt(answer, 10);
+  if (!Number.isInteger(idx) || idx < 1 || idx > candidates.length) {
+    return toast('序号无效', 'error');
+  }
+  const sourceId = candidates[idx - 1].id;
+  if (!confirm('确定合并？\n来源问题将标明去向且不再接受支持，两边支持者按成员去重合并。')) return;
+  sendCmd({ type: 'question_merge', sourceId, targetId });
+});
 
 function renderPeople(snap) {
   els.peopleCount.textContent = snap.participants.length;

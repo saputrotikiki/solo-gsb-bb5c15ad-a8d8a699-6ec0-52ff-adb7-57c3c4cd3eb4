@@ -2070,6 +2070,179 @@ async function main() {
     for (const g of guestsG.slice(1, 5)) await g.close();
   }
 
+  // 29. 现场问题墙：提交/字数上限/支持切换/排序/合并且去重/已合并拒绝/版本守卫/重连恢复
+  {
+    const createdQ = await createRoom('问题主持');
+    const qh = await hostJoin(createdQ, '问题主持');
+    const q1 = await guestJoin(createdQ.room, '提问甲');
+    const q2 = await guestJoin(createdQ.room, '提问乙');
+    const q3 = await guestJoin(createdQ.room, '提问丙');
+    await waitStable(qh, [q1, q2, q3]);
+    const id1 = q1.joined.you.id;
+    const id2 = q2.joined.you.id;
+    const id3 = q3.joined.you.id;
+
+    const openQs = () => qh.snapshot.questions.open;
+    const findQ = (id) => openQs().find((x) => x.id === id);
+    const orderIds = () => openQs().map((x) => x.id);
+
+    // 29a. 三人提交问题（主持人也可提交）
+    await guestSend(qh, q1, { type: 'question_submit', text: '问题一：预算明细？' });
+    await qh.waitFor((c) => c.snapshot.questions.open.length === 1);
+    const qa = openQs()[0];
+    assert.strictEqual(qa.text, '问题一：预算明细？');
+    assert.strictEqual(qa.authorId, id1);
+    assert.strictEqual(qa.supportCount, 0);
+
+    await guestSend(qh, q2, { type: 'question_submit', text: '问题二：时间安排？' });
+    await qh.waitFor((c) => c.snapshot.questions.open.length === 2);
+    const qb = openQs().find((q) => q.authorId === id2);
+
+    await hostCmd(qh, { type: 'question_submit', text: '问题三：主持人也能提' });
+    await qh.waitFor((c) => c.snapshot.questions.open.length === 3);
+    const qc = openQs().find((q) => q.authorId === qh.joined.you.id);
+
+    // 空问题 -> NO_QUESTION_TEXT，版本不变
+    const vBefore = qh.v;
+    q1.lastError = null;
+    await guestSend(qh, q1, { type: 'question_submit', text: '   ' });
+    await q1.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION_TEXT');
+    assert.strictEqual(qh.v, vBefore, '空问题不改变版本');
+
+    // 29b. 超过 120 字自动截断为 120（服务端 slice）
+    const longText = '字'.repeat(150);
+    await guestSend(qh, q3, { type: 'question_submit', text: longText });
+    await qh.waitFor((c) => c.snapshot.questions.open.length === 4);
+    const qlong = openQs().find((q) => q.text.length === 120);
+    assert.ok(qlong, '超长问题应被截断为 120 字');
+    assert.strictEqual(qlong.text, '字'.repeat(120));
+
+    // 29c. 支持切换：q1 支持 qa，q2 支持 qa，q1 重复发送即取消
+    await guestSend(qh, q1, { type: 'question_support', questionId: qa.id });
+    await qh.waitFor((c) => findQ(qa.id) && findQ(qa.id).supportCount === 1);
+    assert.deepStrictEqual(findQ(qa.id).supporterIds, [id1]);
+
+    await guestSend(qh, q2, { type: 'question_support', questionId: qa.id });
+    await qh.waitFor((c) => findQ(qa.id) && findQ(qa.id).supportCount === 2);
+
+    // q1 取消支持
+    await guestSend(qh, q1, { type: 'question_support', questionId: qa.id });
+    await qh.waitFor((c) => findQ(qa.id) && findQ(qa.id).supportCount === 1);
+    assert.deepStrictEqual(findQ(qa.id).supporterIds, [id2]);
+    // q1 再点一次重新支持
+    await guestSend(qh, q1, { type: 'question_support', questionId: qa.id });
+    await qh.waitFor((c) => findQ(qa.id) && findQ(qa.id).supportCount === 2);
+
+    // qb 获得 3 票（q1 q2 q3），qa 维持 2 票 -> qb 排第一
+    await guestSend(qh, q1, { type: 'question_support', questionId: qb.id });
+    await guestSend(qh, q2, { type: 'question_support', questionId: qb.id });
+    await guestSend(qh, q3, { type: 'question_support', questionId: qb.id });
+    await qh.waitFor((c) => findQ(qb.id) && findQ(qb.id).supportCount === 3);
+    assert.strictEqual(orderIds()[0], qb.id, '支持人数最多的排第一');
+    assert.strictEqual(findQ(qb.id).supportCount, 3);
+    // 同票时按提交时间升序（qc 与 qlong 均 0 票，qc 先提交）
+    const zeroVotes = openQs().filter((q) => q.supportCount === 0).map((q) => q.id);
+    assert.deepStrictEqual(zeroVotes, [qc.id, qlong.id], '同票按提交时间先后排序');
+
+    // 29d. 非主持人不能合并 -> FORBIDDEN
+    q1.lastError = null;
+    await guestSend(qh, q1, { type: 'question_merge', sourceId: qa.id, targetId: qb.id });
+    await q1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    // 合并到自身 -> QUESTION_BAD_TARGET
+    qh.lastError = null;
+    await guestSend(qh, qh, { type: 'question_merge', sourceId: qb.id, targetId: qb.id });
+    await qh.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_BAD_TARGET');
+    assert.strictEqual(openQs().length, 4, '非法合并不改变状态');
+
+    // 不存在的问题 -> NO_QUESTION
+    qh.lastError = null;
+    await guestSend(qh, qh, { type: 'question_merge', sourceId: 'q_ghost', targetId: qb.id });
+    await qh.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION');
+
+    // 29e. 主持人把 qa 并入 qb：qa 支持者 {q1,q2}，qb 支持者 {q1,q2,q3}
+    //      去重合并后 qb 仍为 3 人，qa 标记去向且移出 open
+    const vMerge = qh.v;
+    qh.lastError = null;
+    await hostCmd(qh, { type: 'question_merge', sourceId: qa.id, targetId: qb.id });
+    assert.strictEqual(openQs().find((q) => q.id === qa.id), undefined, '来源问题不再出现在未合并列表');
+    const mergedA = qh.snapshot.questions.merged.find((q) => q.id === qa.id);
+    assert.ok(mergedA, '来源问题出现在已合并列表');
+    assert.strictEqual(mergedA.mergedInto, qb.id);
+    assert.strictEqual(mergedA.mergedRootId, qb.id);
+    assert.strictEqual(mergedA.mergedIntoText, '问题二：时间安排？');
+    assert.ok(mergedA.mergedAt > 0);
+    assert.strictEqual(mergedA.mergedByNick, '问题主持');
+    const qbAfter = findQ(qb.id);
+    assert.strictEqual(qbAfter.supportCount, 3, '去重合并：q1/q2 已在 qb 中，不重复计数');
+    assert.deepStrictEqual(qbAfter.supporterIds.sort(), [id1, id2, id3].sort());
+    assert.ok(qh.v === vMerge + 1);
+
+    // 29f. 对已合并问题支持 -> QUESTION_MERGED，计数不变
+    const vAfterMerge = qh.v;
+    q3.lastError = null;
+    await guestSend(qh, q3, { type: 'question_support', questionId: qa.id });
+    await q3.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+    assert.strictEqual(findQ(qb.id).supportCount, 3, '针对已合并问题的操作不得改变计数');
+    assert.strictEqual(qh.v, vAfterMerge, '被拒绝操作不改变版本');
+    assert.ok(q3.lastError.snapshot, '错误应附最新快照');
+
+    // 29g. 已合并问题不能作为来源再次合并
+    qh.lastError = null;
+    await guestSend(qh, qh, { type: 'question_merge', sourceId: qa.id, targetId: qc.id });
+    await qh.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+    // 也不能作为合并目标
+    qh.lastError = null;
+    await guestSend(qh, qh, { type: 'question_merge', sourceId: qc.id, targetId: qa.id });
+    await qh.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+
+    // 29h. 链式合并：把 qb（已含三方支持者）并入 qc。qc 原 0 票，
+    //      合并后 qc 获得 3 名支持者；qa 的去向沿链解析到 qc
+    await hostCmd(qh, { type: 'question_merge', sourceId: qb.id, targetId: qc.id });
+    assert.strictEqual(openQs().find((q) => q.id === qb.id), undefined);
+    const qcAfter = openQs().find((q) => q.id === qc.id);
+    assert.strictEqual(qcAfter.supportCount, 3);
+    const mergedAAgain = qh.snapshot.questions.merged.find((q) => q.id === qa.id);
+    assert.strictEqual(mergedAAgain.mergedInto, qb.id, '直接去向保持为 qb');
+    assert.strictEqual(mergedAAgain.mergedRootId, qc.id, '沿合并链解析到最终目标 qc');
+    assert.strictEqual(mergedAAgain.mergedIntoText, '问题三：主持人也能提', '展示最终目标正文');
+    const mergedB = qh.snapshot.questions.merged.find((q) => q.id === qb.id);
+    assert.strictEqual(mergedB.mergedRootId, qc.id);
+
+    // 29i. 过期版本 -> STALE_VERSION 且附最新快照
+    const staleV = qh.v - 1;
+    qh.lastError = null;
+    qh.send({ type: 'question_support', version: staleV, questionId: qc.id });
+    await qh.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.ok(qh.lastError.snapshot, 'STALE_VERSION 应携带最新快照');
+    assert.strictEqual(qh.lastError.snapshot.version, qh.snapshot.version);
+
+    // 29j. 断线重连后问题与支持记录完整恢复
+    const secret1 = q1.joined.you.secret;
+    await q1.close();
+    await qh.waitFor((c) => c.snapshot.participants.find((p) => p.id === id1 && !p.online));
+    const q1b = new Client();
+    await q1b.open();
+    q1b.send({ type: 'join', room: createdQ.room, nick: '提问甲', participantId: id1, secret: secret1 });
+    await q1b.waitFor((c) => c.joined && c.joined.you.id === id1);
+    assert.strictEqual(q1b.snapshot.questions.open.length, 2, '重连恢复未合并问题');
+    assert.strictEqual(q1b.snapshot.questions.merged.length, 2, '重连恢复已合并问题');
+    const qcView = q1b.snapshot.questions.open.find((q) => q.id === qc.id);
+    assert.strictEqual(qcView.supportCount, 3, '支持计数随快照恢复');
+    const qaView = q1b.snapshot.questions.merged.find((q) => q.id === qa.id);
+    assert.strictEqual(qaView.mergedRootId, qc.id, '合并去向随快照恢复');
+
+    // 29k. 离开成员的支持仍计数（q3 主动离开，qc 支持数不变）
+    q3.send({ type: 'leave' });
+    await qh.waitFor((c) => !c.snapshot.participants.some((p) => p.id === id3));
+    const qcFinal = qh.snapshot.questions.open.find((q) => q.id === qc.id);
+    assert.strictEqual(qcFinal.supportCount, 3, '成员离开不清支持计数');
+    const leftSupporter = qcFinal.supporters.find((s) => s.id === id3);
+    assert.ok(leftSupporter && leftSupporter.present === false, '离开成员标注 present:false');
+
+    await qh.close(); await q1b.close(); await q2.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();

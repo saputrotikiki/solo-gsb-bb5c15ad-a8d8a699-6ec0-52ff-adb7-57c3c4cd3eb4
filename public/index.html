@@ -134,6 +134,33 @@
       </div>
 
       <!-- 议题投票 -->
+      <div class="panel panel-questions">
+        <div class="panel-title">
+          ❓ 现场问题墙 <span class="count" id="question-count">0</span>
+          <span class="hint">提交不超过 120 字的问题，点 👍 支持；支持越多越靠前</span>
+        </div>
+
+        <!-- 当前成员提交问题 -->
+        <form class="question-create" id="question-create-form">
+          <div class="question-input-row">
+            <textarea id="question-text-input" maxlength="120" rows="2"
+                      placeholder="写下你的现场问题（120 字以内）…" autocomplete="off"></textarea>
+            <button class="btn btn-primary" type="submit">提交问题</button>
+          </div>
+          <div class="question-input-meta">
+            <span id="question-char-count">0 / 120</span>
+          </div>
+        </form>
+
+        <!-- 未合并问题：按支持人数降序 -->
+        <ul class="question-list" id="question-list"></ul>
+        <div class="question-empty" id="question-empty">还没有人提交问题，写下第一个现场问题吧</div>
+
+        <!-- 已合并问题：可查看合并去向 -->
+        <div class="question-merged" id="question-merged"></div>
+      </div>
+
+      <!-- 议题投票 -->
       <div class="panel panel-topic">
         <div class="panel-title">
           🗳️ 议题投票
