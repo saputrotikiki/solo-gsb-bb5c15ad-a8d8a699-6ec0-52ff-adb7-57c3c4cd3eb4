@@ -121,6 +121,16 @@ const els = {
   groupConstraintChips: $('#group-constraint-chips'),
   btnGroupFormCancel: $('#btn-group-cancel-form'),
   groupResult: $('#group-result'),
+  // 现场问题墙
+  questionForm: $('#question-form'),
+  questionTextInput: $('#question-text-input'),
+  questionCounter: $('#question-counter'),
+  questionList: $('#question-list'),
+  questionEmpty: $('#question-empty'),
+  questionCount: $('#question-count'),
+  questionMergedBox: $('#question-merged-box'),
+  questionMergedList: $('#question-merged-list'),
+  questionMergedCount: $('#question-merged-count'),
   toast: $('#toast-container')
 };
 
@@ -594,6 +604,7 @@ function render() {
   renderTopic(snap);
   renderTasks(snap);
   renderGroups(snap);
+  renderQuestions(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -1857,6 +1868,139 @@ els.groupForm.addEventListener('submit', (e) => {
     groupCount: k,
     constraints: groupDraft.constraints
   });
+});
+
+// ---------------------------------------------------------------------------
+// 现场问题墙：提交（≤120 字）、支持切换、主持人合并、查看合并去向
+// ---------------------------------------------------------------------------
+
+const QUESTION_TEXT_MAX = 120;
+
+/**
+ * 解析问题的最终去向：沿 mergedInto 链找到当前未合并问题。
+ * 服务端保证去向始终指向未合并问题（合并时传递改标），正常一跳即达；
+ * 若目标问题已被总量上限清理，返回 null（前端标注「去向问题已清理」）。
+ */
+function questionDestination(snap, q) {
+  let cur = q;
+  const seen = new Set([q.id]);
+  while (cur && cur.mergedInto) {
+    if (seen.has(cur.mergedInto)) break; // 防御：理论上不会出现环
+    seen.add(cur.mergedInto);
+    cur = (snap.questions || []).find((x) => x.id === cur.mergedInto);
+  }
+  return cur && cur.mergedInto === null ? cur : null;
+}
+
+function questionCardHtml(snap, q) {
+  const me = state.me;
+  const myId = me ? me.id : null;
+  const mine = myId && q.authorId === myId;
+  const supported = myId && (q.supporters || []).includes(myId);
+  // 主持人合并目标下拉：除自己之外的未合并问题
+  const options = (snap.questions || [])
+    .filter((x) => !x.mergedInto && x.id !== q.id)
+    .map((x) => `<option value="${x.id}">${escapeHtml(x.text.slice(0, 30))}（${x.supportCount} 人支持）</option>`)
+    .join('');
+  const hostMerge = me && me.host && options
+    ? `
+    <div class="question-merge">
+      <select class="question-merge-select" aria-label="选择并入的目标问题">${options}</select>
+      <button class="btn btn-ghost btn-mini" data-q-act="merge" data-q-id="${q.id}"
+              title="把本问题并入目标问题：合并两边支持者，本问题标记去向且不再接受支持">⤵ 并入</button>
+    </div>`
+    : '';
+  return `
+    <div class="q-text">${escapeHtml(q.text)}</div>
+    <div class="q-meta">
+      <span class="q-author">${escapeHtml(q.authorNick)}${mine ? '<span class="me-tag">我</span>' : ''} · ${formatTime(q.createdAt)}</span>
+      <button class="btn ${supported ? 'btn-primary' : 'btn-secondary'} btn-mini q-support-btn${supported ? ' picked' : ''}"
+              data-q-act="support" data-q-id="${q.id}">
+        ${supported ? '✓ 已支持' : '👍 支持'} <span class="q-count">${q.supportCount}</span>
+      </button>
+    </div>
+    ${hostMerge}
+  `;
+}
+
+/**
+ * 问题墙渲染：未合并问题已由服务端按支持人数降序排好；
+ * 已合并问题单列，展示其最终去向（未合并问题的内容）。
+ */
+function renderQuestions(snap) {
+  const questions = snap.questions || [];
+  const open = questions.filter((q) => !q.mergedInto);
+  const merged = questions.filter((q) => q.mergedInto);
+  const myId = state.me ? state.me.id : null;
+
+  els.questionCount.textContent = open.length;
+  els.questionEmpty.classList.toggle('hidden', open.length > 0);
+  els.questionList.classList.toggle('hidden', open.length === 0);
+  els.questionList.textContent = '';
+  for (const q of open) {
+    const li = document.createElement('li');
+    li.className = 'question-card' + (myId && (q.supporters || []).includes(myId) ? ' is-supported' : '');
+    li.dataset.qId = q.id;
+    li.innerHTML = questionCardHtml(snap, q);
+    els.questionList.appendChild(li);
+  }
+
+  els.questionMergedCount.textContent = merged.length;
+  els.questionMergedBox.classList.toggle('is-empty', merged.length === 0);
+  els.questionMergedList.textContent = '';
+  for (const q of merged) {
+    const dest = questionDestination(snap, q);
+    const li = document.createElement('li');
+    li.className = 'question-merged-item';
+    li.innerHTML = dest
+      ? `<div class="q-merged-text">${escapeHtml(q.text)}</div>
+         <div class="q-merged-meta">
+           <span>${escapeHtml(q.authorNick)} · ${formatTime(q.createdAt)}</span>
+           <span class="q-merged-arrow">已并入 ⤵ <b>${escapeHtml(dest.text)}</b>（${dest.supportCount} 人支持）</span>
+         </div>`
+      : `<div class="q-merged-text">${escapeHtml(q.text)}</div>
+         <div class="q-merged-meta"><span class="q-dest-gone">去向问题已被清理</span></div>`;
+    els.questionMergedList.appendChild(li);
+  }
+}
+
+// 提交问题：不超过 120 字（与 maxlength 双重约束），走版本守卫
+els.questionTextInput.addEventListener('input', () => {
+  const len = els.questionTextInput.value.length;
+  els.questionCounter.textContent = `${len}/${QUESTION_TEXT_MAX}`;
+  els.questionCounter.classList.toggle('over', len >= QUESTION_TEXT_MAX);
+});
+
+els.questionForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = els.questionTextInput.value.trim();
+  if (!text) return toast('请填写问题内容', 'error');
+  if (text.length > QUESTION_TEXT_MAX) {
+    return toast(`问题不能超过 ${QUESTION_TEXT_MAX} 字`, 'error');
+  }
+  sendCmd({ type: 'question_submit', text });
+  els.questionTextInput.value = '';
+  els.questionCounter.textContent = `0/${QUESTION_TEXT_MAX}`;
+  els.questionCounter.classList.remove('over');
+});
+
+// 支持切换 / 主持人合并（均走版本守卫；过期或针对已合并问题由服务端拒绝并回最新快照）
+els.questionList.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-q-act]');
+  if (!btn || btn.disabled) return;
+  const id = btn.dataset.qId;
+  if (btn.dataset.qAct === 'support') {
+    sendCmd({ type: 'question_support', questionId: id });
+  } else if (btn.dataset.qAct === 'merge') {
+    const card = e.target.closest('.question-card');
+    const sel = card && card.querySelector('.question-merge-select');
+    const targetId = sel ? sel.value : '';
+    if (!targetId) return toast('请选择要并入的目标问题', 'error');
+    if (!confirm('确定把这条问题并入所选问题？\n两边支持者将合并（同一成员只计一次），本问题标记去向且不再接受支持。')) {
+      return;
+    }
+    sendCmd({ type: 'question_merge', sourceId: id, targetId });
+  }
 });
 
 function renderLogs(snap) {

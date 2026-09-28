@@ -2070,6 +2070,186 @@ async function main() {
     for (const g of guestsG.slice(1, 5)) await g.close();
   }
 
+  // ===========================================================================
+  // 现场问题墙（提交 / 支持切换 / 主持人合并 / 版本守卫 / 断线恢复）
+  // ===========================================================================
+  {
+    const created = await createRoom('问题主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '问甲');
+    const g2 = await guestJoin(created.room, '问乙');
+    const g3 = await guestJoin(created.room, '问丙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    const id3 = g3.joined.you.id;
+    await waitStable(h, [g1, g2, g3]);
+
+    const openQuestions = (snap) => (snap.questions || []).filter((q) => !q.mergedInto);
+    const findQ = (client, id) => client.snapshot.questions.find((q) => q.id === id);
+
+    // 29a. 初始快照含空问题列表；空内容被拒（不改变版本）
+    assert.deepStrictEqual(h.snapshot.questions, [], '初始问题墙应为空');
+    g1.lastError = null;
+    const vEmpty = g1.v;
+    await guestSend(h, g1, { type: 'question_submit', text: '   ' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION_TEXT');
+    assert.strictEqual(g1.v, vEmpty, '空问题不得改变版本');
+
+    // 29b. 三条问题提交：随快照广播，含作者、支持人数 0、未合并标记
+    await guestSend(h, g1, { type: 'question_submit', text: 'Q1-只有一人支持的问题' });
+    await h.waitFor((c) => openQuestions(c.snapshot).length === 1);
+    await guestSend(h, g2, { type: 'question_submit', text: 'Q2-会被合并的问题' });
+    await h.waitFor((c) => openQuestions(c.snapshot).length === 2);
+    await guestSend(h, g3, { type: 'question_submit', text: 'Q3-支持最多的问题' });
+    await h.waitFor((c) => openQuestions(c.snapshot).length === 3);
+
+    const questions = openQuestions(h.snapshot);
+    assert.deepStrictEqual(questions.map((q) => q.text),
+      ['Q1-只有一人支持的问题', 'Q2-会被合并的问题', 'Q3-支持最多的问题'],
+      '同票时按提交时间升序');
+    const q1 = questions[0];
+    const q2 = questions[1];
+    const q3 = questions[2];
+    assert.ok(/^q_/.test(q1.id), '快照需包含 questionId');
+    assert.strictEqual(q1.authorId, id1);
+    assert.strictEqual(q1.authorNick, '问甲');
+    assert.strictEqual(q1.supportCount, 0);
+    assert.deepStrictEqual(q1.supporters, []);
+    assert.strictEqual(q1.mergedInto, null);
+    assert.ok(q1.createdAt > 0);
+
+    // 超长文本在服务端截断为 120 字（不报错，计数仍正常）
+    const longText = '字'.repeat(130);
+    await guestSend(h, g1, { type: 'question_submit', text: longText });
+    await h.waitFor((c) => openQuestions(c.snapshot).length === 4);
+    const longQ = openQuestions(h.snapshot).find((q) => q.text.length === 120);
+    assert.ok(longQ, '超过 120 字的问题应被截断为 120 字');
+
+    // 29c. 支持切换：加入 / 取消；同一成员只计一次
+    await guestSend(h, g1, { type: 'question_support', questionId: q3.id });
+    await h.waitFor((c) => findQ(c, q3.id).supportCount === 1);
+    await guestSend(h, g2, { type: 'question_support', questionId: q3.id });
+    await h.waitFor((c) => findQ(c, q3.id).supportCount === 2);
+    await guestSend(h, g3, { type: 'question_support', questionId: q1.id });
+    await h.waitFor((c) => findQ(c, q1.id).supportCount === 1);
+
+    // g2 再支持 q3 -> 取消（人数回落），重复切换幂等
+    await guestSend(h, g2, { type: 'question_support', questionId: q3.id });
+    await h.waitFor((c) => findQ(c, q3.id).supportCount === 1);
+    assert.deepStrictEqual(findQ(h, q3.id).supporters, [id1], '支持者列表同步为仅 id1');
+    await guestSend(h, g2, { type: 'question_support', questionId: q3.id });
+    await h.waitFor((c) => findQ(c, q3.id).supportCount === 2);
+
+    // 未合并问题按支持人数降序（q3:2 -> q1:1 -> 其余 0），同票按提交时间
+    const ordered = openQuestions(h.snapshot).map((q) => q.id);
+    assert.strictEqual(ordered[0], q3.id, '支持最多的问题排最前');
+    assert.strictEqual(ordered[1], q1.id, '次多支持排第二');
+    assert.deepStrictEqual(ordered.slice(2).sort(), [q2.id, longQ.id].sort());
+
+    // 29d. 不存在 / 已合并问题的支持操作分别返回 NO_QUESTION / QUESTION_MERGED，不改计数
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'question_support', questionId: 'q_ghost' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION');
+
+    // 29e. 非主持人不能合并；来源=目标被拒；目标已合并被拒
+    await guestSend(h, g1, { type: 'question_merge', sourceId: q2.id, targetId: q3.id });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+    h.lastError = null;
+    h.send({ type: 'question_merge', version: h.v, sourceId: q3.id, targetId: q3.id });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_BAD_TARGET');
+    h.lastError = null;
+    h.send({ type: 'question_merge', version: h.v, sourceId: 'q_ghost', targetId: q3.id });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION');
+
+    // 29f. 主持人合并 q2 -> q3：两边支持者取并集（同一成员只计一次），
+    // 来源标记去向、移出未合并列表、不再接受支持；目标计数只增不重复
+    // q3 支持者：id1、id2；q2 支持者：无。先让 q2 拥有 id3 与 id1（id1 重复验证去重）
+    await guestSend(h, g3, { type: 'question_support', questionId: q2.id });
+    await h.waitFor((c) => findQ(c, q2.id).supportCount === 1);
+    await guestSend(h, g1, { type: 'question_support', questionId: q2.id });
+    await h.waitFor((c) => findQ(c, q2.id).supportCount === 2);
+    const vBeforeMerge = h.v;
+    h.send({ type: 'question_merge', version: vBeforeMerge, sourceId: q2.id, targetId: q3.id });
+    await h.waitFor((c) => c.v === vBeforeMerge + 1
+      && openQuestions(c.snapshot).every((q) => q.id !== q2.id));
+    const mergedQ2 = findQ(h, q2.id);
+    const targetQ3 = findQ(h, q3.id);
+    assert.strictEqual(mergedQ2.mergedInto, q3.id, '来源问题标明去向');
+    assert.ok(mergedQ2.mergedAt > 0);
+    assert.strictEqual(targetQ3.supportCount, 3, '合并两边支持者且同一成员只计一次');
+    assert.deepStrictEqual(targetQ3.supporters.sort(), [id1, id2, id3].sort());
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'question' && /并入/.test(l.text)),
+      '合并需写入操作记录');
+
+    // 已合并问题不再接受支持（即使曾经支持过它）
+    g3.lastError = null;
+    await guestSend(h, g3, { type: 'question_support', questionId: q2.id });
+    await g3.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+    assert.strictEqual(findQ(h, q2.id).supportCount, 2, '针对已合并问题的操作不得改变计数');
+    assert.strictEqual(findQ(h, q3.id).supportCount, 3);
+
+    // 合并到已合并的目标被拒（应并入其当前去向）
+    h.lastError = null;
+    h.send({ type: 'question_merge', version: h.v, sourceId: q1.id, targetId: q2.id });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+    assert.strictEqual(findQ(h, q1.id).mergedInto, null, '被拒合并不改变来源状态');
+
+    // 29g. 传递合并：q1 -> q3（q1 有支持者 id3），随后 q3 -> longQ；
+    // 此前已并入 q3 的 q2 去向也应改标到 longQ
+    // q3 当前支持者 id1,id2,id3；先让 q1 拥有一个 q3 没有的支持者用于验证并集
+    // id3 已支持 q3，q1 现有支持者 id3 -> 合并 q1 到 q3 不会新增
+    h.send({ type: 'question_merge', version: h.v, sourceId: q1.id, targetId: q3.id });
+    await h.waitFor((c) => findQ(c, q1.id).mergedInto === q3.id);
+    assert.strictEqual(findQ(h, q3.id).supportCount, 3, '重复支持者不增加计数');
+
+    h.send({ type: 'question_merge', version: h.v, sourceId: q3.id, targetId: longQ.id });
+    await h.waitFor((c) => findQ(c, q3.id).mergedInto === longQ.id);
+    assert.strictEqual(findQ(h, q2.id).mergedInto, longQ.id, '已并入 q3 的 q2 去向改标到 longQ');
+    assert.strictEqual(findQ(h, q1.id).mergedInto, longQ.id, '传递链上的 q1 去向同样改标');
+    const finalTarget = findQ(h, longQ.id);
+    assert.strictEqual(finalTarget.mergedInto, null, '最终目标仍为未合并问题');
+    assert.strictEqual(finalTarget.supportCount, 3, '最终目标合并全部支持者（去重）');
+
+    // 29h. 过期请求一律 STALE_VERSION + 最新快照，不改变计数
+    const vNow = h.v;
+    g1.lastError = null;
+    g1.send({ type: 'question_submit', version: g1.v - 1, text: '过期提交' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(g1.lastError.snapshot.version, h.snapshot.version);
+    g2.lastError = null;
+    g2.send({ type: 'question_support', version: g2.v - 1, questionId: longQ.id });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    h.lastError = null;
+    h.send({ type: 'question_merge', version: vNow - 1, sourceId: longQ.id, targetId: q3.id });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.v, vNow, '过期命令不得改变版本');
+
+    // 29i. 问题及支持记录随快照同步：断线重连后完整恢复（含合并去向）
+    await g1.close();
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id1);
+      return p && p.online === false;
+    });
+    const g1b = new Client();
+    await g1b.open();
+    g1b.send({ type: 'join', room: created.room, nick: '问甲', participantId: id1, secret: g1.joined.you.secret });
+    await g1b.waitFor((c) => c.joined && c.joined.you.id === id1);
+    const reopened = openQuestions(g1b.snapshot).map((q) => q.id);
+    assert.deepStrictEqual(reopened.sort(), [longQ.id].sort(), '重连后未合并问题列表恢复');
+    assert.strictEqual(g1b.snapshot.questions.find((q) => q.id === q2.id).mergedInto, longQ.id,
+      '重连后合并去向恢复');
+    assert.strictEqual(g1b.snapshot.questions.find((q) => q.id === q3.id).mergedInto, longQ.id);
+    const restoredTarget = g1b.snapshot.questions.find((q) => q.id === longQ.id);
+    assert.strictEqual(restoredTarget.supportCount, 3, '重连后支持计数恢复');
+    assert.ok(restoredTarget.supporters.includes(id1), '重连后支持者明细恢复');
+
+    // 重连后仍可正常提交与支持
+    await guestSend(h, g1b, { type: 'question_submit', text: '重连后的新问题' });
+    await h.waitFor((c) => openQuestions(c.snapshot).some((q) => q.text === '重连后的新问题'));
+
+    await h.close(); await g1b.close(); await g2.close(); await g3.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();

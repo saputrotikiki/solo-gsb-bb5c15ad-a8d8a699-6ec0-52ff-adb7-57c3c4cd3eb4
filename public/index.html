@@ -255,6 +255,34 @@
         <div class="group-result" id="group-result"></div>
       </div>
 
+      <!-- 现场问题墙 -->
+      <div class="panel panel-side panel-questions">
+        <div class="panel-title">
+          ❓ 现场问题墙 <span class="count" id="question-count">0</span>
+          <span class="hint">按支持人数排序</span>
+        </div>
+
+        <!-- 提交问题（不超过 120 字） -->
+        <form class="question-form" id="question-form">
+          <textarea id="question-text-input" class="question-input" rows="2" maxlength="120"
+                    placeholder="写下你的现场问题（不超过 120 字），提交后可获得大家支持"></textarea>
+          <div class="question-form-row">
+            <span class="question-counter" id="question-counter">0/120</span>
+            <button class="btn btn-primary btn-mini" type="submit">提交问题</button>
+          </div>
+        </form>
+
+        <!-- 未合并问题（按支持人数降序） -->
+        <ul class="question-list" id="question-list"></ul>
+        <div class="question-empty" id="question-empty">还没有问题，提交第一条现场问题吧</div>
+
+        <!-- 已合并问题（可查看去向） -->
+        <details class="question-merged" id="question-merged-box">
+          <summary>已合并问题 <span class="count" id="question-merged-count">0</span></summary>
+          <ul class="question-merged-list" id="question-merged-list"></ul>
+        </details>
+      </div>
+
       <div class="panel panel-side panel-logs">
         <div class="panel-title">
           操作记录

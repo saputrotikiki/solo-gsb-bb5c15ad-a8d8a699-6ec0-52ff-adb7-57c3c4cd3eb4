@@ -39,6 +39,10 @@
  *   { type: "task_deadline_reject",  version, taskId }  // 主持人：拒绝延期（保留理由）
  *   { type: "group_generate", version, memberIds:[pid...], groupCount, constraints:[{a,b,type}] }
  *                                                       // 主持人：生成分组讨论方案（type=together|apart）
+ *   { type: "question_submit",  version, text }          // 当前成员：提交现场问题（不超过 120 字）
+ *   { type: "question_support", version, questionId }    // 对未合并问题切换支持状态（再发一次取消）
+ *   { type: "question_merge",   version, sourceId, targetId }
+ *                                                       // 主持人：把一条问题并入另一条未合并问题
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -127,6 +131,17 @@
  * 成员标注 present:false 并按留存昵称展示），断线重连后凭快照完整恢复。
  * 生成命令复用主持人权限与版本守卫：过期返回 STALE_VERSION，包含已离开成员、
  * 参数非法（人数/组数/约束越界等）返回 GROUP_BAD_*——均附最新快照且不改版本。
+ *
+ * 现场问题墙：当前房间成员均可提交不超过 120 字的问题（question_submit），
+ * 并可对「未合并」问题切换支持状态（question_support，同一成员只计一次，
+ * 再发一次即取消）。主持人可把一条问题并入另一条未合并问题
+ * （question_merge）：合并把两边支持者取并集（同一成员只计一次），
+ * 来源问题标记 mergedInto 目标并保留内容、不再接受支持；此前已直接并入
+ * 来源的问题会一并改标去向，保证去向始终指向当前未合并问题。
+ * 问题与支持记录随房间快照 questions 字段下发（未合并在前、按支持人数降序），
+ * 断线重连后凭快照完整恢复。提交 / 支持 / 合并全部沿用现有 WebSocket 身份
+ * 与版本守卫：过期请求返回 STALE_VERSION、针对已合并（或不存在）问题的操作
+ * 返回 QUESTION_MERGED / NO_QUESTION——一律附最新快照且不改变计数。
  */
 
 'use strict';
@@ -184,6 +199,12 @@ const GROUP_MAX_COUNT = 4;
 // 分组讨论：约束对数上限（12 人全部两两组合）
 const GROUP_MAX_CONSTRAINTS = 66;
 const GROUP_CONSTRAINT_TYPES = ['together', 'apart'];
+// 现场问题墙：单条问题最大字数
+const QUESTION_TEXT_MAX = 120;
+// 现场问题墙：房间内未合并问题数量上限
+const QUESTION_OPEN_LIMIT = parseInt(process.env.QUESTION_OPEN_LIMIT, 10) || 200;
+// 现场问题墙：问题（含已合并）总保留数量上限，超出时淘汰最老的已合并问题
+const QUESTION_TOTAL_LIMIT = parseInt(process.env.QUESTION_TOTAL_LIMIT, 10) || 1000;
 
 const app = express();
 const server = http.createServer(app);
@@ -266,6 +287,12 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     constraints: [{ a, b, type }],     // 生成时的约束（type: together|apart）
  *     groups: [[idx...]]                  // 分组结果：以 members 下标表示，每人恰好出现一次，组规模差 ≤1
  *   },
+ *   questions: [{           // 现场问题墙（提交顺序保存，快照视图按支持人数排序下发）
+ *     id, text, authorId, authorNick, createdAt,
+ *     supporters: Set<participantId>,    // 支持者（同一成员只计一次；离开房间也保留其支持记录）
+ *     mergedInto: questionId | null,     // 非 null 表示已并入该问题（不再接受支持），去向始终指向未合并问题
+ *     mergedAt                            // 合并时间（未合并时为 null）
+ *   }],
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
  * }
@@ -291,6 +318,7 @@ function newRoom(code) {
     topicHistory: [],
     tasks: new Map(),
     groupPlan: null,
+    questions: [],
     logs: [],
     createdAt: Date.now(),
     lastSeen: Date.now()
@@ -998,6 +1026,123 @@ function buildGroupPlanView(room) {
 }
 
 // ---------------------------------------------------------------------------
+// 现场问题墙：提交 / 支持切换 / 主持人合并
+// ---------------------------------------------------------------------------
+
+/**
+ * 提交一条现场问题。调用方已完成身份与版本守卫以及文本校验。
+ * 作者昵称即时留存（与行动项、分组方案一致），成员离开房间后仍可展示。
+ */
+function createQuestion(room, author, text) {
+  const question = {
+    id: genId('q_'),
+    text,
+    authorId: author.id,
+    authorNick: author.nick,
+    createdAt: Date.now(),
+    supporters: new Set(),
+    mergedInto: null,
+    mergedAt: null
+  };
+  room.questions.push(question);
+  pruneQuestions(room);
+  addLog(room, 'question', `「${author.nick}」提交了问题：${text}`);
+  return question;
+}
+
+/**
+ * 切换对一条未合并问题的支持状态：已支持则取消，未支持则加入。
+ * 同一成员只计一次（Set 天然去重）。调用方已完成身份与版本守卫。
+ * 返回 true 表示操作后为「已支持」，false 表示「已取消」。
+ */
+function toggleQuestionSupport(room, question, participantId) {
+  if (question.supporters.has(participantId)) {
+    question.supporters.delete(participantId);
+    return false;
+  }
+  question.supporters.add(participantId);
+  return true;
+}
+
+/**
+ * 主持人把来源问题并入目标问题：
+ * - 两边支持者取并集（同一成员只计一次）；
+ * - 来源问题标记去向（mergedInto）并保留内容，不再接受支持；
+ * - 此前已直接并入来源的问题一并改标去向，保证所有 mergedInto 始终指向
+ *   当前未合并问题（去向链不会断）。
+ * 调用方已完成主持人与版本守卫，并确认来源与目标均为未合并的不同问题。
+ */
+function mergeQuestions(room, source, target, host) {
+  for (const pid of source.supporters) {
+    target.supporters.add(pid);
+  }
+  const now = Date.now();
+  source.mergedInto = target.id;
+  source.mergedAt = now;
+  // 传递改标：已并入来源的问题，去向统一改到当前目标
+  for (const q of room.questions) {
+    if (q.mergedInto === source.id) {
+      q.mergedInto = target.id;
+      q.mergedAt = now;
+    }
+  }
+  pruneQuestions(room);
+  addLog(
+    room,
+    'question',
+    `主持人「${host.nick}」将问题「${source.text}」并入「${target.text}」（合并后 ${target.supporters.size} 人支持）`
+  );
+}
+
+/**
+ * 总量上限保护：超过 QUESTION_TOTAL_LIMIT 时淘汰最老的已合并问题。
+ * 未合并问题永不被淘汰；淘汰已合并问题不会断开任何去向（被指向的都是未合并问题）。
+ */
+function pruneQuestions(room) {
+  if (room.questions.length <= QUESTION_TOTAL_LIMIT) return;
+  const excess = room.questions.length - QUESTION_TOTAL_LIMIT;
+  let removed = 0;
+  room.questions = room.questions.filter((q) => {
+    if (removed < excess && q.mergedInto) {
+      removed += 1;
+      return false;
+    }
+    return true;
+  });
+}
+
+/** 单条问题快照视图：支持者以 id 数组下发，支持人数由其长度决定 */
+function buildQuestionView(question) {
+  return {
+    id: question.id,
+    text: question.text,
+    authorId: question.authorId,
+    authorNick: question.authorNick,
+    createdAt: question.createdAt,
+    supportCount: question.supporters.size,
+    supporters: [...question.supporters],
+    mergedInto: question.mergedInto,
+    mergedAt: question.mergedAt
+  };
+}
+
+/**
+ * 问题墙快照视图：未合并在前（按支持人数降序、人数相同按提交时间升序），
+ * 已合并问题按合并时间倒序附在其后，便于查看每条问题的合并去向。
+ */
+function buildQuestionsView(room) {
+  const open = [];
+  const merged = [];
+  for (const q of room.questions) {
+    if (q.mergedInto) merged.push(q);
+    else open.push(q);
+  }
+  open.sort((a, b) => b.supporters.size - a.supporters.size || a.createdAt - b.createdAt);
+  merged.sort((a, b) => b.mergedAt - a.mergedAt);
+  return [...open, ...merged].map(buildQuestionView);
+}
+
+// ---------------------------------------------------------------------------
 // 安全撤销
 // ---------------------------------------------------------------------------
 
@@ -1012,6 +1157,7 @@ const UNDO_REASON_TEXT = {
   quota_changed: '发言配额周期出现新的变更',
   task_changed: '行动项状态出现新的变更',
   group_changed: '分组讨论方案出现新的变更',
+  question_changed: '现场问题墙出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -1199,6 +1345,7 @@ function buildSnapshot(room) {
     topic: buildTopicView(room.topic),
     tasks: [...room.tasks.values()].map((t) => buildTaskView(room, t)),
     groupPlan: buildGroupPlanView(room),
+    questions: buildQuestionsView(room),
     topicHistory: room.topicHistory.map((t) => ({
       id: t.id,
       title: t.title,
@@ -1346,6 +1493,9 @@ wss.on('connection', (ws) => {
         case 'task_deadline_approve':
         case 'task_deadline_reject':
         case 'group_generate':
+        case 'question_submit':
+        case 'question_support':
+        case 'question_merge':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -2369,6 +2519,75 @@ function handleCommand(ws, msg, room, pid, isHost) {
         `主持人${regenerate ? '重新' : ''}生成分组讨论方案：${memberIds.length} 人分为 ${groupCount} 组（${sizes} 人），约束 ${constraints.length} 条`
       );
       return commit(room, { undoReason: 'group_changed' });
+    }
+
+    case 'question_submit': {
+      if (!guardVersion(ws, msg, room)) return;
+      const text = String(msg.text ?? '').trim().slice(0, QUESTION_TEXT_MAX);
+      if (!text) {
+        return sendError(ws, '请填写问题内容', 'NO_QUESTION_TEXT', room);
+      }
+      let openCount = 0;
+      for (const q of room.questions) {
+        if (!q.mergedInto) openCount += 1;
+      }
+      if (openCount >= QUESTION_OPEN_LIMIT) {
+        return sendError(
+          ws,
+          `未合并问题已达上限（${QUESTION_OPEN_LIMIT} 条），请先合并部分问题`,
+          'QUESTION_LIMIT',
+          room
+        );
+      }
+      createQuestion(room, me, text);
+      return commit(room, { undoReason: 'question_changed' });
+    }
+
+    case 'question_support': {
+      if (!guardVersion(ws, msg, room)) return;
+      const question = room.questions.find((q) => q.id === String(msg.questionId || ''));
+      if (!question) {
+        return sendError(ws, '问题不存在或已被清理', 'NO_QUESTION', room);
+      }
+      // 已合并问题不再接受支持：切换、重复支持一律拒绝且不改变计数
+      if (question.mergedInto) {
+        return sendError(ws, '该问题已合并，不能再支持', 'QUESTION_MERGED', room);
+      }
+      const supported = toggleQuestionSupport(room, question, pid);
+      addLog(
+        room,
+        'question',
+        supported
+          ? `「${me.nick}」支持了问题「${question.text}」（${question.supporters.size} 人支持）`
+          : `「${me.nick}」取消支持问题「${question.text}」（${question.supporters.size} 人支持）`
+      );
+      return commit(room, { undoReason: 'question_changed' });
+    }
+
+    case 'question_merge': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const sourceId = String(msg.sourceId || '');
+      const targetId = String(msg.targetId || '');
+      if (sourceId === targetId) {
+        return sendError(ws, '来源问题与目标问题不能是同一条', 'QUESTION_BAD_TARGET', room);
+      }
+      const source = room.questions.find((q) => q.id === sourceId);
+      if (!source) {
+        return sendError(ws, '来源问题不存在或已被清理', 'NO_QUESTION', room);
+      }
+      if (source.mergedInto) {
+        return sendError(ws, '来源问题已经合并，不能再次合并', 'QUESTION_MERGED', room);
+      }
+      const target = room.questions.find((q) => q.id === targetId);
+      if (!target) {
+        return sendError(ws, '目标问题不存在或已被清理', 'NO_QUESTION', room);
+      }
+      if (target.mergedInto) {
+        // 目标已合并：引导主持人把来源并入其去向（计数与去向都不会出错）
+        return sendError(ws, '目标问题已合并，请并入其当前去向问题', 'QUESTION_MERGED', room);
+      }
+      mergeQuestions(room, source, target, me);
+      return commit(room, { undoReason: 'question_changed' });
     }
   }
 }
